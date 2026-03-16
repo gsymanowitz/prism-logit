@@ -879,12 +879,15 @@ class PRISMLogit:
         Returns
         -------
         metrics : dict
-            Dictionary of classification metrics.
+            Dictionary of classification metrics including confusion matrix.
         """
+        from sklearn.metrics import confusion_matrix
+
         y = np.array(y, dtype=np.float64).flatten()
         yp = self.predict_proba(X)
         yc = (yp >= 0.5).astype(int)
         d2 = 1.0 - self._deviance(y, yp) / self._null_deviance_calc(y)
+        cm = confusion_matrix(y.astype(int), yc)
 
         metrics = {
             'D\u00b2': d2,
@@ -894,8 +897,11 @@ class PRISMLogit:
             'Precision': precision_score(y, yc, zero_division=0),
             'Recall': recall_score(y, yc, zero_division=0),
             'F1': f1_score(y, yc, zero_division=0),
-            'Brier Score': brier_score_loss(y, yp)
+            'Brier Score': brier_score_loss(y, yp),
+            'Confusion Matrix': cm
         }
+
+        tn, fp, fn, tp = cm.ravel()
 
         print(f"\n{set_name} Set Evaluation:")
         print("-" * 40)
@@ -907,6 +913,10 @@ class PRISMLogit:
         print(f"  Recall:      {metrics['Recall'] * 100:.1f}%")
         print(f"  F1:          {metrics['F1']:.4f}")
         print(f"  Brier Score: {metrics['Brier Score']:.4f}")
+        print(f"\n  Confusion Matrix:")
+        print(f"                 Predicted 0  Predicted 1")
+        print(f"    Actual 0     {tn:>8}     {fp:>8}")
+        print(f"    Actual 1     {fn:>8}     {tp:>8}")
 
         return metrics
 
@@ -963,74 +973,335 @@ class PRISMLogit:
         }
 
     # ==================================================================
-    # Visualization
+    # Visualization — Signature PRISM Chart
     # ==================================================================
 
-    def plot_results(self, X: pd.DataFrame, y=None, figsize=(15, 10)):
+    def plot_prism_chart(self, figsize=None, logistic_baseline=True,
+                         title="PRISM-Logit Chart",
+                         subtitle="Sequential Deviance Decomposition "
+                                  "and Best-fit Variable Transforms",
+                         dataset_name=None):
         """
-        Create comprehensive visualization of results.
+        Generate the signature PRISM-Logit waterfall chart showing sequential
+        deviance attribution with transformation mini-curves.
+
+        Variables (including interactions) are displayed in decreasing
+        order of incremental D² contribution (largest first). Font sizes,
+        bar widths, and figure width scale automatically so the chart
+        remains readable with up to ~25 terms.
 
         Parameters
         ----------
-        X : pd.DataFrame
-            Predictor variables (used for x-axis values).
-        y : array-like, optional
-            True labels (for ROC curve if provided).
-        figsize : tuple, default=(15, 10)
-            Figure size.
+        figsize : tuple or None
+            Figure size. When None the width scales with the number of
+            terms (base 18 in, +0.9 in per term beyond 9).
+        logistic_baseline : bool, default=True
+            Show the standard logistic D² as a red line on the TOTAL bar.
+        title : str
+        subtitle : str
+        dataset_name : str or None
+            Shown on a separate line below the subtitle.
 
         Returns
         -------
-        fig : matplotlib.figure.Figure
+        matplotlib.figure.Figure
         """
+        from matplotlib.patches import FancyBboxPatch
+        import math
+
         if self.final_model is None:
             raise ValueError("Model has not been fitted yet. Call fit() first.")
 
         fm = self.final_model
-        n_features = len(fm['selected_features'])
-        n_cols = 3
-        n_rows = (n_features + 2) // n_cols + 1
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
-        axes = axes.flatten()
+        # --- Collect data (base + interactions) ---
+        feats = list(fm['selected_features'])
+        n_sel = len(feats)
 
-        # Plot each transformed variable's contribution to log-odds
-        for idx, feat in enumerate(fm['selected_features']):
-            ax = axes[idx]
-            transform = fm['transform_dict'][feat]
-            x_raw = X[feat].values
-            x_transformed = self._apply_transform(x_raw, transform)
+        # Get incremental D² from round_results
+        round_df = self.step2_results['round_results']
+        inc_d2_raw = [round_df.iloc[i]['\u0394D\u00b2'] * 100 for i in range(n_sel)]
+        transforms_raw = [fm['transform_dict'][f] for f in feats]
+        coefs_raw = [fm['coefficients'].get(f, 1.0) for f in feats]
 
-            sort_idx = np.argsort(x_raw)
-            contribution = fm['coefficients'][feat] * x_transformed
+        # Append interaction terms
+        inter_names, inter_d2, inter_transforms, inter_coefs = [], [], [], []
+        if fm['interactions']:
+            for inter in fm['interactions']:
+                inter_names.append(f"{inter['feature_j']}\n\u00d7 {inter['feature_k']}")
+                inter_d2.append(inter['d2_gain'] * 100)
+                inter_transforms.append(inter['transform'])
+                inter_coefs.append(fm['coefficients'].get(inter['name'], 1.0))
 
-            ax.plot(x_raw[sort_idx], contribution[sort_idx], 'b-', linewidth=2)
-            ax.set_xlabel(feat)
-            ax.set_ylabel('Log-odds contribution')
-            ax.set_title(f"{feat} ({transform})")
-            ax.grid(True, alpha=0.3)
-            ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        # Combine and sort by contribution
+        all_names = feats + inter_names
+        all_d2 = inc_d2_raw + inter_d2
+        all_trans = transforms_raw + inter_transforms
+        all_coefs = coefs_raw + inter_coefs
+        n_terms = len(all_names)
 
-        # Attribution bar chart
-        ax = axes[n_features]
-        attr = fm['attribution']
-        main_attr = attr[attr['Feature'] != 'Multivariate Refinement']
-        if len(main_attr) > 0:
-            features = main_attr['Feature'].values
-            d2_vals = main_attr['\u0394D\u00b2'].values * 100
-            colors = ['#2196F3' if '\u00d7' not in f else '#FF9800' for f in features]
-            ax.barh(range(len(features)), d2_vals, color=colors)
-            ax.set_yticks(range(len(features)))
-            ax.set_yticklabels(features, fontsize=8)
-            ax.set_xlabel('\u0394D\u00b2 (%)')
-            ax.set_title('Deviance Attribution')
-            ax.invert_yaxis()
+        order = sorted(range(n_terms), key=lambda k: all_d2[k], reverse=True)
+        names_sorted = [all_names[k] for k in order]
+        d2_sorted = [all_d2[k] for k in order]
+        trans_sorted = [all_trans[k] for k in order]
+        coefs_sorted = [all_coefs[k] for k in order]
+        is_interaction = [k >= n_sel for k in order]
 
-        # Hide unused subplots
-        for idx in range(n_features + 1, len(axes)):
-            axes[idx].axis('off')
+        total_d2 = fm['final_d2'] * 100
+        logistic_val = fm.get('baseline_d2', None)
+        if logistic_val is not None:
+            logistic_val *= 100
 
-        plt.tight_layout()
+        variables = names_sorted + ['TOTAL']
+        incremental = d2_sorted + [total_d2]
+        all_transforms = trans_sorted + ['']
+        cumulative = list(np.cumsum([0.0] + d2_sorted))
+        num_vars = len(variables)
+
+        # --- Adaptive sizing ---
+        if figsize is None:
+            fig_w = max(18, 9 + num_vars * 1.0)
+            figsize = (fig_w, 11)
+
+        fs = min(1.0, 9.0 / max(num_vars, 1))
+        fs = max(fs, 0.55)
+
+        _palette = [
+            '#c084fc', '#818cf8', '#38bdf8', '#22d3ee',
+            '#34d399', '#facc15', '#fb923c', '#f87171',
+            '#e879f9', '#a78bfa', '#67e8f9', '#a3e635',
+        ]
+        if n_terms <= len(_palette):
+            colors = _palette[:n_terms]
+        else:
+            import colorsys
+            colors = []
+            for i in range(n_terms):
+                hue = (i / n_terms) % 1.0
+                r, g, b = colorsys.hls_to_rgb(hue, 0.65, 0.55)
+                colors.append((r, g, b))
+        colors.append('#6b7280')  # grey for TOTAL
+
+        y_axis_max = math.ceil(total_d2 / 10) * 10
+
+        # --- Figure ---
+        fig = plt.figure(figsize=figsize)
+        fig.patch.set_facecolor('white')
+
+        # Logo (fetched from GitHub)
+        _LOGO_URL = ("https://raw.githubusercontent.com/gsymanowitz/"
+                     "prism-logit/main/prism_logo.png")
+        try:
+            import urllib.request
+            import io
+            from PIL import Image as _PILImage
+            with urllib.request.urlopen(_LOGO_URL, timeout=5) as resp:
+                logo = _PILImage.open(io.BytesIO(resp.read()))
+            logo_ax = fig.add_axes([0.02, 0.84, 0.12, 0.12],
+                                   anchor='NW', zorder=1)
+            logo_ax.imshow(logo)
+            logo_ax.axis('off')
+        except Exception:
+            pass
+
+        # Titles
+        fig.text(0.5, 0.98, title,
+                 ha='center', va='top', fontsize=36,
+                 fontweight='bold', color='#2d3748')
+        fig.text(0.5, 0.93, subtitle,
+                 ha='center', va='top', fontsize=17, color='#718096')
+        if dataset_name:
+            fig.text(0.5, 0.90, dataset_name,
+                     ha='center', va='top', fontsize=17, color='#718096')
+
+        ax = fig.add_axes([0.10, 0.10, 0.85, 0.73])
+        bar_width = 0.9
+
+        # --- Waterfall bars ---
+        for i in range(num_vars):
+            bl = i
+            if i < n_terms:
+                height = d2_sorted[i]
+                bottom = cumulative[i]
+                edge = '#4a5568' if is_interaction[i] else 'none'
+                ls = '--' if is_interaction[i] else '-'
+                rect = FancyBboxPatch(
+                    (bl, bottom), bar_width, height,
+                    boxstyle='round,pad=0.05',
+                    facecolor=colors[i], edgecolor=edge,
+                    linewidth=1.5 if is_interaction[i] else 0,
+                    linestyle=ls, alpha=0.92, zorder=2)
+                ax.add_patch(rect)
+                ax.text(bl + bar_width / 2, bottom + height + 1.5,
+                        f'+{height:.1f}%',
+                        ha='center', va='bottom',
+                        fontsize=max(13 * fs, 7), fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.5',
+                                  facecolor='white',
+                                  edgecolor='#e2e8f0', alpha=0.95))
+                if i < n_terms - 1:
+                    ax.plot([bl + bar_width, i + 1],
+                            [cumulative[i + 1], cumulative[i + 1]],
+                            'k--', lw=1.8, alpha=0.35, zorder=1)
+            else:
+                # TOTAL bar
+                rect = FancyBboxPatch(
+                    (bl, 0), bar_width, total_d2,
+                    boxstyle='round,pad=0.05',
+                    facecolor=colors[-1], edgecolor='none',
+                    alpha=0.92, zorder=2)
+                ax.add_patch(rect)
+                ax.text(bl + bar_width / 2, total_d2 + 1.5,
+                        f'{total_d2:.1f}%',
+                        ha='center', va='bottom',
+                        fontsize=max(14 * fs, 8), fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.5',
+                                  facecolor='#d1d5db',
+                                  edgecolor='#9ca3af', alpha=0.95))
+                # Logistic baseline line (replaces OLS line from regression)
+                if logistic_baseline and logistic_val is not None:
+                    ax.plot([bl, bl + bar_width],
+                            [logistic_val, logistic_val],
+                            'r-', lw=4, zorder=10)
+                    ax.text(bl - 0.05, logistic_val,
+                            f'Logistic: {logistic_val:.1f}%',
+                            ha='right', va='center',
+                            fontsize=max(10 * fs, 7),
+                            fontweight='bold', color='white',
+                            bbox=dict(boxstyle='round,pad=0.4',
+                                      facecolor='#ef4444',
+                                      edgecolor='none', alpha=0.95))
+
+        # --- Variable blocks below chart ---
+        block_height_data = 30
+        block_bottom_data = -33
+
+        for i, (var, trans, contrib) in enumerate(
+                zip(variables, all_transforms, incremental)):
+            bl = i
+            if i < n_terms:
+                edge = '#4a5568' if is_interaction[i] else 'none'
+                ls = '--' if is_interaction[i] else '-'
+                block = FancyBboxPatch(
+                    (bl, block_bottom_data), bar_width, block_height_data,
+                    boxstyle='round,pad=0.05',
+                    facecolor=colors[i], edgecolor=edge,
+                    linewidth=1.5 if is_interaction[i] else 0,
+                    linestyle=ls, alpha=0.92, zorder=1)
+                ax.add_patch(block)
+
+                ax.text(bl + bar_width / 2,
+                        block_bottom_data + block_height_data * 0.92,
+                        var, ha='center', va='top',
+                        fontsize=max(11 * fs, 6.5),
+                        fontweight='bold', color='white', zorder=3)
+                ax.text(bl + bar_width / 2,
+                        block_bottom_data + block_height_data * 0.72,
+                        f'({trans})', ha='center', va='top',
+                        fontsize=max(10 * fs, 6),
+                        color='white', alpha=0.95, zorder=3)
+                ax.text(bl + bar_width / 2,
+                        block_bottom_data + block_height_data * 0.55,
+                        f'+{contrib:.1f}%', ha='center', va='top',
+                        fontsize=max(10.5 * fs, 6.5),
+                        fontweight='bold', color='white', zorder=3,
+                        bbox=dict(boxstyle='round,pad=0.35',
+                                  facecolor='black', alpha=0.18,
+                                  edgecolor='none'))
+
+                # Transformation mini-curve (sign-aware)
+                coef_sign = np.sign(coefs_sorted[i]) if coefs_sorted[i] != 0 else 1.0
+                cx = np.linspace(0, 1, 100)
+                if trans == 'Linear':
+                    cy = cx
+                elif trans == 'Inverse':
+                    cy = 1 / (cx * 10 + 1)
+                elif trans == 'Cubic':
+                    cy = cx ** 3
+                elif trans == 'Sqrt':
+                    cy = np.sqrt(cx)
+                elif trans == 'Square':
+                    cy = cx ** 2
+                elif trans in ('Log', 'Logarithmic'):
+                    cy = np.log(cx * 10 + 1)
+                elif trans == 'Exponential':
+                    cy = np.exp(cx)
+                else:
+                    cy = cx
+
+                cy = cy * coef_sign
+                cy_range = cy.max() - cy.min()
+                if cy_range > 0:
+                    cy = (cy - cy.min()) / cy_range
+                else:
+                    cy = np.full_like(cy, 0.5)
+
+                cx_s = bl + 0.15 * bar_width + cx * 0.7 * bar_width
+                cy_s = (block_bottom_data + 0.08 * block_height_data
+                        + cy * 0.35 * block_height_data)
+                ax.plot(cx_s, cy_s, 'w-', lw=max(2.5 * fs, 1.2),
+                        alpha=0.95, zorder=3)
+
+            else:
+                # TOTAL block
+                block = FancyBboxPatch(
+                    (bl, block_bottom_data), bar_width, block_height_data,
+                    boxstyle='round,pad=0.05',
+                    facecolor=colors[-1], edgecolor='none',
+                    alpha=0.92, zorder=1)
+                ax.add_patch(block)
+                ax.text(bl + bar_width / 2,
+                        block_bottom_data + block_height_data * 0.92,
+                        'TOTAL\nEXPLAINED\nDEVIANCE',
+                        ha='center', va='top',
+                        fontsize=max(8.5 * fs, 5.5),
+                        fontweight='bold', color='white',
+                        linespacing=1.3, zorder=3)
+                ax.text(bl + bar_width / 2,
+                        block_bottom_data + block_height_data * 0.58,
+                        f'{contrib:.1f}%', ha='center', va='top',
+                        fontsize=max(12 * fs, 7), fontweight='bold',
+                        color='white', zorder=3,
+                        bbox=dict(boxstyle='round,pad=0.35',
+                                  facecolor='black', alpha=0.22,
+                                  edgecolor='none'))
+
+        # --- Info text ---
+        info_y = block_bottom_data - 4
+        lines = [
+            'How to read this chart:',
+            'Each colored bar shows a variable\'s incremental '
+            'contribution to D\u00b2 (explained deviance).',
+            'The blocks below display each variable\'s transformation '
+            'type and contribution percentage, with a curve showing '
+            'that transformation\'s shape.',
+        ]
+        if any(is_interaction):
+            lines.append('Dashed outlines indicate interaction terms.')
+        for idx, line in enumerate(lines):
+            ax.text(0, info_y - idx * 2.5, line,
+                    ha='left', va='top', fontsize=max(11 * fs, 7),
+                    color='#4a5568', zorder=3)
+
+        # --- Axis formatting ---
+        ax.set_xlim(-0.5, num_vars + 0.5)
+        ax.set_ylim(info_y - 10, y_axis_max + 10)
+        ax.set_ylabel('Cumulative D\u00b2 (%)', fontsize=15,
+                       fontweight='600', color='#4a5568')
+        ax.set_xticks([])
+        y_ticks = list(range(0, y_axis_max + 1, 10))
+        ax.set_yticks(y_ticks)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_visible(False)
+        ax.spines['left'].set_color('#cbd5e0')
+        ax.spines['left'].set_bounds(0, y_axis_max)
+        for yt in range(10, y_axis_max + 1, 10):
+            ax.axhline(y=yt, color='#e2e8f0', ls='-', lw=0.5,
+                        alpha=0.3, zorder=0)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis='y', labelsize=12, colors='#4a5568')
+
         return fig
 
 
