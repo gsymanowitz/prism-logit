@@ -715,15 +715,17 @@ class PRISMLogit:
                 })
 
         # Sort base variables + interactions by ΔD² descending, then append MR at end
+        _D2_KEY = list(rows[0].keys())[2]   # third key is the ΔD² column
+        _CUM_KEY = list(rows[0].keys())[3]  # fourth key is Cumulative D²
         all_var_rows = rows + int_rows
-        all_var_rows.sort(key=lambda r: r['\u0394D\u00b2'], reverse=True)
+        all_var_rows = sorted(all_var_rows, key=lambda r: r[_D2_KEY], reverse=True)
 
         # Recompute cumulative D² in sorted order
         cum = 0.0
         for r in all_var_rows:
-            cum += r['\u0394D\u00b2']
-            r['Cumulative D\u00b2'] = cum
-        mr_row['Cumulative D\u00b2'] = cum + self.step3_results['mr']
+            cum += r[_D2_KEY]
+            r[_CUM_KEY] = cum
+        mr_row[_CUM_KEY] = cum + self.step3_results['mr']
 
         all_rows = all_var_rows + [mr_row]
 
