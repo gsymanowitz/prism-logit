@@ -693,21 +693,39 @@ class PRISMLogit:
                 'Feature': r['Feature'], 'Transform': r['Transform'],
                 '\u0394D\u00b2': r['\u0394D\u00b2'], 'Cumulative D\u00b2': r['Cumulative D\u00b2']
             })
-        rows.append({
+
+        # MR row (keep separate)
+        mr_row = {
             'Feature': 'Multivariate Refinement', 'Transform': '\u2014',
             '\u0394D\u00b2': self.step3_results['mr'],
             'Cumulative D\u00b2': self.step3_results['final_d2']
-        })
+        }
+
+        # Interaction rows
+        int_rows = []
         if has_int:
             cum = self.step3_results['final_d2']
             for s in self.step4_results['interactions_selected']:
                 cum += s['d2_gain']
-                rows.append({
+                int_rows.append({
                     'Feature': f"{s['feature_j']} \u00d7 {s['feature_k']}",
                     'Transform': s['transform'],
                     '\u0394D\u00b2': s['d2_gain'],
                     'Cumulative D\u00b2': cum
                 })
+
+        # Sort base variables + interactions by ΔD² descending, then append MR at end
+        all_var_rows = rows + int_rows
+        all_var_rows.sort(key=lambda r: r['\u0394D\u00b2'], reverse=True)
+
+        # Recompute cumulative D² in sorted order
+        cum = 0.0
+        for r in all_var_rows:
+            cum += r['\u0394D\u00b2']
+            r['Cumulative D\u00b2'] = cum
+        mr_row['Cumulative D\u00b2'] = cum + self.step3_results['mr']
+
+        all_rows = all_var_rows + [mr_row]
 
         # Classification metrics
         yc = (pred >= 0.5).astype(int)
@@ -731,7 +749,7 @@ class PRISMLogit:
             'coefficients': fc,
             'intercept': fi,
             'interactions': self.step4_results['interactions_selected'],
-            'attribution': pd.DataFrame(rows),
+            'attribution': pd.DataFrame(all_rows),
             'final_d2': final_d2,
             'base_d2': self.step3_results['final_d2'],
             'baseline_d2': 1.0 - bl['deviance'] / self.null_deviance,
@@ -783,21 +801,29 @@ class PRISMLogit:
         print(f"  Improvement over logistic:   "
               f"+{(fm['final_d2'] - fm['baseline_d2']) * 100:.2f} pp")
 
-        print("\n\nFINAL MODEL PARAMETERS:")
+        print("\n\nFINAL MODEL PARAMETERS (sorted by \u0394D\u00b2):")
         print("-" * 70)
         print(f"  Intercept (\u03b2\u2080): {fm['intercept']:.6f}")
         print()
-        for f in fm['selected_features']:
-            cat_tag = " [cat]" if f in self.categorical_features else ""
-            print(f"  {f:20s} ({fm['transform_dict'][f]:12s}): "
-                  f"\u03b2 = {fm['coefficients'][f]:.6f}{cat_tag}")
 
-        if fm['interactions']:
-            print("\n  Interactions:")
-            for s in fm['interactions']:
-                print(f"  {s['feature_j']} \u00d7 {s['feature_k']} ({s['transform']})")
-                print(f"    \u0394D\u00b2 = {s['d2_gain'] * 100:.2f}%, "
-                      f"\u0394BIC = {s['delta_bic']:.1f}")
+        # Sort base features by ΔD²
+        attr = fm['attribution']
+        base_attr = attr[(attr['Feature'] != 'Multivariate Refinement')]
+        for _, row in base_attr.iterrows():
+            f = row['Feature']
+            if '\u00d7' in f:
+                # Interaction
+                inter = [s for s in fm['interactions']
+                         if f"{s['feature_j']} \u00d7 {s['feature_k']}" == f]
+                if inter:
+                    s = inter[0]
+                    print(f"  {f:20s} ({s['transform']:12s}): "
+                          f"\u0394D\u00b2 = {row['\u0394D\u00b2'] * 100:.2f}%")
+            elif f in fm['transform_dict']:
+                cat_tag = " [cat]" if f in self.categorical_features else ""
+                print(f"  {f:20s} ({fm['transform_dict'][f]:12s}): "
+                      f"\u03b2 = {fm['coefficients'][f]:.6f}, "
+                      f"\u0394D\u00b2 = {row['\u0394D\u00b2'] * 100:.2f}%{cat_tag}")
 
         print(f"\n  Variables selected: {len(fm['selected_features'])}")
         print(f"  Interactions selected: {len(fm['interactions'])}")
